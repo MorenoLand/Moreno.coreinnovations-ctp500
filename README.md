@@ -1,6 +1,13 @@
 # ThermalPrint
 
-PC utility for printing to an InstaPrint Bluetooth thermal printer.
+PC utility for printing to a Core Innovations CTP500BR / InstaPrint Bluetooth thermal printer.
+
+Target printer specs:
+
+- 384 dots wide
+- 200 DPI
+- 48 mm paper
+- BLE advertising name: `B Pink Printer`
 
 ## Build
 
