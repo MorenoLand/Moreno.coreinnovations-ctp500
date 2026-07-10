@@ -7,7 +7,6 @@ Target printer specs:
 - 384 dots wide
 - 200 DPI
 - 48 mm paper
-- BLE advertising name: `B Pink Printer`
 
 ## Build
 
