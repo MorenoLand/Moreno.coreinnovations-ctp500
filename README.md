@@ -1,6 +1,6 @@
 # ThermalPrint
 
-PC utility for printing to a Core Innovations CTP500BR / InstaPrint Bluetooth thermal printer.
+PC utility for printing to a Core Innovations CTP500BR Bluetooth thermal printer.
 
 Target printer specs:
 
