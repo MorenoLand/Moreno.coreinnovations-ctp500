@@ -18,6 +18,10 @@
     <SelfContained>true</SelfContained>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <NoWarn>$(NoWarn);CA1416</NoWarn>
+    <ApplicationIcon>thermalprint.ico</ApplicationIcon>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <DebugType>none</DebugType>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
   </PropertyGroup>
   <PropertyGroup Condition="'$(BuildLib)' == 'true'">
     <OutputType>Library</OutputType>
@@ -27,7 +31,7 @@
     <PackageReference Include="Plugin.BLE" Version="3.2.1" />
   </ItemGroup>
   <ItemGroup Condition="'$(BuildLib)' != 'true'">
-    <None Include="thermalprint.png" CopyToOutputDirectory="PreserveNewest" />
+    <EmbeddedResource Include="thermalprint.png" LogicalName="thermalprint.png" />
     <PackageReference Include="Avalonia" Version="11.2.3" />
     <PackageReference Include="Avalonia.Desktop" Version="11.2.3" />
     <PackageReference Include="Avalonia.Themes.Simple" Version="11.2.3" />

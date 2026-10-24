@@ -25,6 +25,22 @@ using static TrayIcon;
 #endif
 
 #if GUI
+class Settings {
+    public string? LastDevice { get; set; }
+    public int Threshold { get; set; } = 128;
+    public bool Dither { get; set; } = true;
+    public bool Invert { get; set; }
+    public int Density { get; set; } = 3;
+    static string FilePath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ThermalPrint", "settings.json");
+    public static Settings Load() {
+        try { if (File.Exists(FilePath)) return System.Text.Json.JsonSerializer.Deserialize<Settings>(File.ReadAllText(FilePath)) ?? new Settings(); } catch { }
+        return new Settings();
+    }
+    public void Save() {
+        try { Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!); File.WriteAllText(FilePath, System.Text.Json.JsonSerializer.Serialize(this)); } catch { }
+    }
+}
+
 static class T {
     public static ISolidColorBrush BG => S(25, 25, 28);
     public static ISolidColorBrush Panel => S(37, 37, 40);
@@ -50,9 +66,28 @@ public static class Cmd {
     public static byte[] PrintModeImg()  => new byte[] { 0x51,0x78,0xBE,0x00,0x01,0x00,0x00,0x00,0xFF };
     public static byte[] PrintModeText() => new byte[] { 0x51,0x78,0xBE,0x00,0x01,0x00,0x01,0x07,0xFF };
     public static byte[] EscInit() => new byte[] { 0x1B, 0x40 };
+    // Frame: 51 78 <cmd> <dir> <len lo> <len hi> <payload...> <crc8(payload)> FF
+    // CRC-8 poly 0x07, init 0 (matches the density/stop/devid frames above).
+    public static byte Crc8(ReadOnlySpan<byte> d) {
+        byte c = 0;
+        foreach (var b in d) {
+            c ^= b;
+            for (int i = 0; i < 8; i++) c = (byte)((c & 0x80) != 0 ? (c << 1) ^ 0x07 : c << 1);
+        }
+        return c;
+    }
+    public static byte[] Frame(byte cmd, params byte[] payload) {
+        var f = new byte[8 + payload.Length];
+        f[0] = 0x51; f[1] = 0x78; f[2] = cmd; f[3] = 0x00;
+        f[4] = (byte)(payload.Length & 0xFF); f[5] = (byte)(payload.Length >> 8);
+        payload.CopyTo(f, 6);
+        f[6 + payload.Length] = Crc8(payload);
+        f[7 + payload.Length] = 0xFF;
+        return f;
+    }
     public static byte[] FeedLines(int lines) {
-        byte hi = (byte)(lines >> 8), lo = (byte)(lines & 0xFF);
-        return new byte[] { 0x51,0x78,0xA1,0x00,0x02,0x00,hi,lo,0xFF };
+        lines = Math.Clamp(lines, 1, 0xFFFF);
+        return Frame(0xA1, (byte)(lines & 0xFF), (byte)(lines >> 8));
     }
     public static byte[] SetDensity(int level) {
         byte[][] d = {
@@ -144,6 +179,8 @@ class App {
     const string TX_UUID = "49535343-8841-43f4-a8d4-ecbe34729bb3";
     const string RX_UUID = "49535343-1e4d-4bd9-ba61-23c647249616";
 
+    public static Stream? AppIcon() => typeof(App).Assembly.GetManifestResourceStream("thermalprint.png");
+
     public static Window? _mainWindow;
     static TrayHelper? _tray;
 
@@ -187,6 +224,9 @@ class App {
 
     static Window BuildWindow() {
         var state = new PrinterState();
+        var settings = Settings.Load();
+        state.Invert = settings.Invert;
+        bool printing = false;
         var log = new List<string>();
         var canvasRef = new Canvas();
 
@@ -200,7 +240,7 @@ class App {
             Background = T.BG, Foreground = T.Text,
             TransparencyLevelHint = new List<WindowTransparencyLevel> { WindowTransparencyLevel.AcrylicBlur }
         };
-        try { var ip = Path.Combine(AppContext.BaseDirectory, "thermalprint.png"); if (File.Exists(ip)) win.Icon = new WindowIcon(ip); } catch { }
+        try { using var st = AppIcon(); if (st != null) win.Icon = new WindowIcon(st); } catch { }
 
         var winRoot = new Grid();
         winRoot.RowDefinitions.Add(new RowDefinition(32, GridUnitType.Pixel));
@@ -212,7 +252,7 @@ class App {
         Grid.SetRow(titleBar, 0); winRoot.Children.Add(titleBar);
         var tbGrid = new Grid(); titleBar.Child = tbGrid;
         var titleCenter = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
-        try { var ip = Path.Combine(AppContext.BaseDirectory, "thermalprint.png"); if (File.Exists(ip)) titleCenter.Children.Add(new Image { Source = new Bitmap(ip), Width = 20, Height = 20, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0,0,6,0) }); } catch { }
+        try { using var st = AppIcon(); if (st != null) titleCenter.Children.Add(new Image { Source = new Bitmap(st), Width = 20, Height = 20, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0,0,6,0) }); } catch { }
         titleCenter.Children.Add(new TextBlock { Text = "THERMAL PRINT", Foreground = T.Text, FontSize = 12, FontWeight = FontWeight.SemiBold, VerticalAlignment = VerticalAlignment.Center });
         tbGrid.Children.Add(titleCenter);
         var btnPanel = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
@@ -271,39 +311,42 @@ class App {
         sb.Children.Add(statusTxt);
         var batteryTxt = new TextBlock { Text = "", Foreground = T.TextDim, FontSize = 10, Margin = new Thickness(0,0,0,2) };
         sb.Children.Add(batteryTxt);
+        var batteryBar = new ProgressBar { Minimum = 0, Maximum = 100, Height = 4, Margin = new Thickness(0,0,0,4), IsVisible = false, Background = T.Surface };
+        sb.Children.Add(batteryBar);
         var paperStatTxt = new TextBlock { Text = "", Foreground = T.TextDim, FontSize = 10, Margin = new Thickness(0,0,0,4) };
         sb.Children.Add(paperStatTxt);
         var connectBtn = FlatBtn("Connect to Printer");
         sb.Children.Add(connectBtn);
+        var chooseBtn = FlatBtn("Choose device...", 26);
+        sb.Children.Add(chooseBtn);
 
         var printerControls = new StackPanel { IsVisible = false };
         sb.Children.Add(printerControls);
 
         // Density
-        var densityLabel = new TextBlock { Text = "Density: 3 (Default)", Foreground = T.TextDim, FontSize = 10, Margin = new Thickness(0,8,0,2) };
+        string[] densityNames = { "Lightest", "Light", "Default", "Dark", "Darkest" };
+        settings.Density = Math.Clamp(settings.Density, 1, 5);
+        var densityLabel = new TextBlock { Text = $"Density: {settings.Density} ({densityNames[settings.Density - 1]})", Foreground = T.TextDim, FontSize = 10, Margin = new Thickness(0,8,0,2) };
         printerControls.Children.Add(densityLabel);
-        var densitySlider = new Slider { Minimum = 1, Maximum = 5, Value = 3, IsSnapToTickEnabled = true, TickFrequency = 1, Height = 20 };
+        var densitySlider = new Slider { Minimum = 1, Maximum = 5, Value = settings.Density, IsSnapToTickEnabled = true, TickFrequency = 1, Height = 20 };
         printerControls.Children.Add(densitySlider);
         densitySlider.ValueChanged += async (_, _) => {
             int level = (int)densitySlider.Value - 1;
-            string[] names = { "Lightest", "Light", "Default", "Dark", "Darkest" };
-            densityLabel.Text = $"Density: {(int)densitySlider.Value} ({names[level]})";
+            densityLabel.Text = $"Density: {(int)densitySlider.Value} ({densityNames[level]})";
+            settings.Density = (int)densitySlider.Value; settings.Save();
             if (state.IsConnected) { await state.Send(Cmd.SetDensity(level)); Log($"Density → level {(int)densitySlider.Value}"); }
         };
 
         // Feed controls
         var feedRow = new Grid { Margin = new Thickness(0,6,0,0) };
         feedRow.ColumnDefinitions.Add(new ColumnDefinition(1, GridUnitType.Star));
-        feedRow.ColumnDefinitions.Add(new ColumnDefinition(60, GridUnitType.Pixel));
         feedRow.ColumnDefinitions.Add(new ColumnDefinition(1, GridUnitType.Star));
-        var feedBackBtn = FlatBtn("◀ Back");
-        var feedFwdBtn = FlatBtn("Fwd ▶");
-        var feedInput = new NumericUpDown { Value = 1, Minimum = 1, Maximum = 9999, Width = 56, Height = 30, FontSize = 11, Margin = new Thickness(2,4,2,0) };
-        Grid.SetColumn(feedBackBtn, 0); Grid.SetColumn(feedInput, 1); Grid.SetColumn(feedFwdBtn, 2);
-        feedRow.Children.Add(feedBackBtn); feedRow.Children.Add(feedInput); feedRow.Children.Add(feedFwdBtn);
+        var feedInput = new NumericUpDown { Value = 20, Minimum = 1, Maximum = 1000, Height = 30, FontSize = 11, Margin = new Thickness(0,4,4,0) };
+        var feedFwdBtn = FlatBtn("Feed Lines");
+        Grid.SetColumn(feedInput, 0); Grid.SetColumn(feedFwdBtn, 1);
+        feedRow.Children.Add(feedInput); feedRow.Children.Add(feedFwdBtn);
         printerControls.Children.Add(feedRow);
         feedFwdBtn.Click += async (_, _) => { int n = (int)(feedInput.Value ?? 1); await state.Send(Cmd.FeedLines(n)); Log($"Feed {n} lines"); };
-        feedBackBtn.Click += (_, _) => Log("Backoff not supported on this firmware");
 
         // Self-test / Stop
         var testRow = new Grid { Margin = new Thickness(0,4,0,0) };
@@ -324,21 +367,9 @@ class App {
             await state.Send(Cmd.GetStatus());
         };
 
-        // PAPER
-        Header("PAPER");
-        var paperOpts = new ComboBox { Height = 30, Foreground = T.Text, Background = T.Surface, BorderBrush = T.Border, Margin = new Thickness(0,4,0,0), FontSize = 12 };
-        paperOpts.ItemsSource = new[] { "57mm Roll (384px)", "Label 40×30mm", "Label 40×60mm", "Label 15mm width" };
-        paperOpts.SelectedIndex = 0;
-        sb.Children.Add(paperOpts);
-        int paperW = 384, displayH = 200;
-        (int w, int h)[] paperSizes = { (384, 0), (320, 240), (320, 480), (120, 0) };
-        paperOpts.SelectionChanged += (_, _) => {
-            var (w, h) = paperSizes[paperOpts.SelectedIndex];
-            paperW = w; displayH = h > 0 ? h : (state.ImgH > 0 ? state.ImgH : 200);
-            Refresh();
-        };
-
         // IMAGE
+        const int PaperW = 384;
+        Slider threshSlider = null!; CheckBox ditherChk = null!;
         Header("IMAGE");
         var imgBtn = FlatBtn("Load Image"); sb.Children.Add(imgBtn);
         var imgName = new TextBlock { Foreground = T.TextDim, FontSize = 10, Margin = new Thickness(0,2,0,0), TextTrimming = TextTrimming.CharacterEllipsis };
@@ -346,105 +377,154 @@ class App {
         imgBtn.Click += async (_, _) => {
             var files = await win.StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions {
                 Title = "Load Image",
-                FileTypeFilter = new[] { new FilePickerFileType("Images") { Patterns = new[] { "*.jpg","*.jpeg","*.png","*.bmp","*.gif","*.tiff" } } }
+                FileTypeFilter = new[] { new FilePickerFileType("Images") { Patterns = new[] { "*.jpg","*.jpeg","*.png","*.bmp","*.gif" } } }
             });
-            if (files.Count > 0) {
+            if (files.Count == 0) return;
+            try {
                 using var stream = await files[0].OpenReadAsync();
-                var bmp = new Bitmap(stream);
-                double scale = (double)paperW / bmp.PixelSize.Width;
-                state.ImgW = paperW; state.ImgH = (int)(bmp.PixelSize.Height * scale);
-                state.Image = bmp; displayH = state.ImgH;
-                imgName.Text = files[0].Name; Refresh();
-            }
+                await LoadImage(stream, files[0].Name);
+            } catch (Exception ex) { Log($"Image load failed: {ex.Message}"); await ShowMsg(win, $"Could not load image: {ex.Message}"); }
         };
+        async Task LoadImage(Stream stream, string name) {
+            var bmp = SkiaSharp.SKBitmap.Decode(stream);
+            if (bmp == null) { Log($"Unsupported image: {name}"); await ShowMsg(win, $"Could not load {name}: unsupported image format."); return; }
+            state.Source?.Dispose();
+            state.Source = bmp;
+            imgName.Text = name; Refresh();
+        }
+        DragDrop.SetAllowDrop(win, true);
+        win.AddHandler(DragDrop.DropEvent, async (_, e) => {
+            try {
+                var f = e.Data.GetFiles()?.OfType<IStorageFile>().FirstOrDefault();
+                if (f == null) return;
+                using var stream = await f.OpenReadAsync();
+                await LoadImage(stream, f.Name);
+            } catch (Exception ex) { Log($"Image drop failed: {ex.Message}"); }
+        });
+        sb.Children.Add(new TextBlock { Text = "…or drag an image onto the window", Foreground = T.TextDim, FontSize = 10, Margin = new Thickness(0,2,0,0) });
 
         // TEXT
         Header("TEXT");
-        var textInput = new TextBox { Height = 30, Text = "Hello World", FontSize = 12, Padding = new Thickness(6,4), Margin = new Thickness(0,4,0,0) };
+        var textInput = new TextBox { MinHeight = 60, Text = "Hello World", FontSize = 12, Padding = new Thickness(6,4), Margin = new Thickness(0,4,0,0), AcceptsReturn = true, TextWrapping = TextWrapping.Wrap };
         sb.Children.Add(textInput);
-        var textSize = new ComboBox { Height = 30, Foreground = T.Text, Background = T.Surface, BorderBrush = T.Border, Margin = new Thickness(0,4,0,0), FontSize = 12 };
+        var textSize = new ComboBox { Height = 30, Foreground = T.Text, Background = T.Surface, BorderBrush = T.Border, Margin = new Thickness(0,4,0,0), FontSize = 12, HorizontalAlignment = HorizontalAlignment.Stretch };
         textSize.ItemsSource = new[] { "12","16","20","24","32","48" };
         textSize.SelectedIndex = 3; sb.Children.Add(textSize);
+        var alignBox = new ComboBox { Height = 30, Foreground = T.Text, Background = T.Surface, BorderBrush = T.Border, Margin = new Thickness(0,4,0,0), FontSize = 12, HorizontalAlignment = HorizontalAlignment.Stretch };
+        alignBox.ItemsSource = new[] { "Left","Center","Right" }; alignBox.SelectedIndex = 0; sb.Children.Add(alignBox);
+        var boldChk = new CheckBox { Content = "Bold", FontSize = 12, Margin = new Thickness(0,4,0,0) };
+        sb.Children.Add(boldChk);
         var textAddBtn = FlatBtn("Add Text"); sb.Children.Add(textAddBtn);
+        var textUndoBtn = FlatBtn("Remove Last Text"); sb.Children.Add(textUndoBtn);
         textAddBtn.Click += (_, _) => {
+            if (string.IsNullOrWhiteSpace(textInput.Text)) return;
             if (int.TryParse((string?)textSize.SelectedItem, out int sz) && sz > 0)
-                state.Texts.Add(new TextLayer(textInput.Text ?? "", sz, 0, 0));
+                state.Texts.Add(new TextLayer(textInput.Text!, sz, Math.Max(0, alignBox.SelectedIndex), boldChk.IsChecked == true));
             Refresh();
         };
+        textUndoBtn.Click += (_, _) => { if (state.Texts.Count > 0) { state.Texts.RemoveAt(state.Texts.Count - 1); Refresh(); } };
 
         // ADJUST
         Header("ADJUST");
-        var threshSlider = new Slider { Minimum = 0, Maximum = 100, Value = 50, Height = 20, Margin = new Thickness(0,2,0,6) };
-        var threshLabel = new TextBlock { Text = "Threshold 50", Foreground = T.TextDim, FontSize = 11 };
+        threshSlider = new Slider { Minimum = 0, Maximum = 255, Value = Math.Clamp(settings.Threshold, 0, 255), Height = 20, Margin = new Thickness(0,2,0,6) };
+        var threshLabel = new TextBlock { Text = $"Threshold {Math.Clamp(settings.Threshold, 0, 255)}", Foreground = T.TextDim, FontSize = 11 };
         sb.Children.Add(threshLabel); sb.Children.Add(threshSlider);
-        threshSlider.ValueChanged += (_, _) => { threshLabel.Text = $"Threshold {(int)threshSlider.Value}"; Refresh(); };
-        var invertChk = new CheckBox { Content = "Invert output", IsChecked = false, FontSize = 12, Margin = new Thickness(0,2,0,0) };
+        threshSlider.ValueChanged += (_, _) => { threshLabel.Text = $"Threshold {(int)threshSlider.Value}"; settings.Threshold = (int)threshSlider.Value; settings.Save(); Refresh(); };
+        ditherChk = new CheckBox { Content = "Dither photos (Floyd-Steinberg)", IsChecked = settings.Dither, FontSize = 12, Margin = new Thickness(0,2,0,0) };
+        sb.Children.Add(ditherChk);
+        ditherChk.IsCheckedChanged += (_, _) => { settings.Dither = ditherChk.IsChecked == true; settings.Save(); Refresh(); };
+        var invertChk = new CheckBox { Content = "Invert output", IsChecked = settings.Invert, FontSize = 12, Margin = new Thickness(0,4,0,0) };
         sb.Children.Add(invertChk);
-        invertChk.IsCheckedChanged += (_, _) => { state.Invert = invertChk.IsChecked == true; Refresh(); };
-        var bwChk = new CheckBox { Content = "Black & White preview", IsChecked = false, FontSize = 12, Margin = new Thickness(0,4,0,0) };
-        sb.Children.Add(bwChk);
-        bwChk.IsCheckedChanged += (_, _) => { state.BWPreview = bwChk.IsChecked == true; Refresh(); };
+        invertChk.IsCheckedChanged += (_, _) => { state.Invert = invertChk.IsChecked == true; settings.Invert = state.Invert; settings.Save(); Refresh(); };
 
         // CLEAR / PRINT
         sb.Children.Add(new Border { Height = 1, Background = T.Border, Margin = new Thickness(0,16,0,8) });
         var clearBtn = FlatBtn("Clear All"); sb.Children.Add(clearBtn);
-        clearBtn.Click += (_, _) => { state.Clear(); displayH = paperSizes[paperOpts.SelectedIndex].h > 0 ? paperSizes[paperOpts.SelectedIndex].h : 200; imgName.Text = ""; Refresh(); };
+        clearBtn.Click += (_, _) => { state.Clear(); imgName.Text = ""; Refresh(); };
         var printBtn = new Button {
             Content = "PRINT", Height = 44, FontSize = 14, FontWeight = FontWeight.Bold,
             Background = T.Accent, Foreground = Brushes.White, BorderThickness = new Thickness(0),
+            HorizontalAlignment = HorizontalAlignment.Stretch, HorizontalContentAlignment = HorizontalAlignment.Center,
             Margin = new Thickness(0,10,0,0), Cursor = Cursor.Parse("Hand")
         };
         sb.Children.Add(printBtn);
+        var printProgress = new ProgressBar { Minimum = 0, Maximum = 1, Height = 4, Margin = new Thickness(0,6,0,0), IsVisible = false, Foreground = T.Accent };
+        sb.Children.Add(printProgress);
 
-        // Connect handler
-        connectBtn.Click += async (_, _) => {
-            if (state.IsConnected) {
-                state.Disconnect();
-                statusTxt.Text = "● Disconnected"; statusTxt.Foreground = T.Orange;
-                connectBtn.Content = "Connect to Printer";
-                batteryTxt.Text = ""; paperStatTxt.Text = "";
-                printerControls.IsVisible = false;
-                return;
-            }
-            connectBtn.IsEnabled = false; connectBtn.Content = "Scanning...";
-            try {
-                var addr = await state.ScanForPrinter(PRINTER_SVC, Log);
-                if (addr == null) {
-                    statusTxt.Text = "● Not found"; statusTxt.Foreground = T.Red;
-                    connectBtn.Content = "Connect to Printer"; connectBtn.IsEnabled = true; return;
+        void SetConnected(bool on, string? text = null, ISolidColorBrush? color = null) {
+            printerControls.IsVisible = on;
+            connectBtn.Content = on ? "Disconnect" : (settings.LastDevice != null ? "Reconnect" : "Connect to Printer");
+            chooseBtn.IsVisible = !on;
+            statusTxt.Text = text ?? (on ? "● Connected" : "● Disconnected");
+            statusTxt.Foreground = color ?? (on ? T.Green : T.Orange);
+            if (!on) { batteryTxt.Text = ""; paperStatTxt.Text = ""; batteryBar.IsVisible = false; state.Battery = null; state.LastStatus = null; }
+        }
+        state.ConnectionLost = () => Dispatcher.UIThread.Post(() => SetConnected(false, "● Connection lost", T.Red));
+
+        // Connect: reconnect to the remembered printer first, otherwise (or on request) pick from a live scan.
+        void ApplyRx(byte[] data) {
+            var bat = Cmd.ParseBattery(data);
+            var sts = Cmd.ParseStatus(data);
+            if (bat.HasValue) state.Battery = bat.Value;
+            if (sts.HasValue) state.LastStatus = sts.Value;
+            Dispatcher.UIThread.Post(() => {
+                if (bat.HasValue) {
+                    batteryTxt.Text = $"Battery: {bat.Value}%";
+                    var col = bat.Value < 20 ? T.Red : bat.Value < 50 ? T.Orange : T.Green;
+                    batteryTxt.Foreground = col; batteryBar.Foreground = col;
+                    batteryBar.Value = bat.Value; batteryBar.IsVisible = true;
                 }
-                connectBtn.Content = "Connecting...";
-                await state.Connect(addr, TX_UUID, RX_UUID, Log, async (data) => {
-                    var bat = Cmd.ParseBattery(data);
-                    var sts = Cmd.ParseStatus(data);
-                    await Dispatcher.UIThread.InvokeAsync(() => {
-                        if (bat.HasValue) {
-                            batteryTxt.Text = $"Battery: {bat.Value}%";
-                            batteryTxt.Foreground = bat.Value < 20 ? T.Red : bat.Value < 50 ? T.Orange : T.Green;
-                        }
-                        if (sts.HasValue) {
-                            var (po, co, oh) = sts.Value;
-                            paperStatTxt.Text = po ? "⚠ Paper out" : co ? "⚠ Cover open" : oh ? "⚠ Overheat" : "● Paper OK";
-                            paperStatTxt.Foreground = (po || co || oh) ? T.Orange : T.Green;
-                        }
-                    });
-                });
-                statusTxt.Text = "● Thermal Printer"; statusTxt.Foreground = T.Green;
-                connectBtn.Content = "Disconnect";
-                printerControls.IsVisible = true;
-                await Task.Delay(200);
-                await state.Send(Cmd.GetBattery());
-                await Task.Delay(100);
-                await state.Send(Cmd.GetStatus());
-                await Task.Delay(100);
-                await state.Send(Cmd.GetInfo());
+                if (sts.HasValue) {
+                    var (po, co, oh) = sts.Value;
+                    paperStatTxt.Text = po ? "⚠ Paper out" : co ? "⚠ Cover open" : oh ? "⚠ Overheat" : "● Paper OK";
+                    paperStatTxt.Foreground = (po || co || oh) ? T.Orange : T.Green;
+                }
+            });
+        }
+        async Task<bool> ConnectTo(string addr) {
+            statusTxt.Text = "● Connecting..."; statusTxt.Foreground = T.Orange;
+            connectBtn.Content = "Connecting...";
+            await state.Connect(addr, TX_UUID, RX_UUID, Log, data => { ApplyRx(data); return Task.CompletedTask; });
+            settings.LastDevice = addr; settings.Save();
+            SetConnected(true);
+            await Task.Delay(200);
+            await state.Send(Cmd.SetDensity(settings.Density - 1)); Log($"Density → level {settings.Density}");
+            await Task.Delay(100);
+            await state.Send(Cmd.GetBattery());
+            await Task.Delay(100);
+            await state.Send(Cmd.GetStatus());
+            await Task.Delay(100);
+            await state.Send(Cmd.GetInfo());
+            return true;
+        }
+        async Task ConnectFlow(bool forcePick) {
+            if (state.IsConnected) { state.Disconnect(); SetConnected(false); return; }
+            connectBtn.IsEnabled = false; chooseBtn.IsEnabled = false;
+            try {
+                if (!forcePick && settings.LastDevice != null) {
+                    try { await ConnectTo(settings.LastDevice); return; }
+                    catch (Exception ex) { Log($"Reconnect failed ({ex.Message}); choose a device."); state.Disconnect(); }
+                }
+                connectBtn.Content = "Choose a device...";
+                var addr = await PickDevice(win, state, Log);
+                if (addr == null) { SetConnected(false); return; }
+                await ConnectTo(addr);
             } catch (Exception ex) {
-                statusTxt.Text = "● Failed"; statusTxt.Foreground = T.Red;
-                connectBtn.Content = "Connect to Printer";
+                SetConnected(false, "● Connect failed", T.Red);
                 Log($"ERROR: {ex.Message}");
-            }
-            connectBtn.IsEnabled = true;
+            } finally { connectBtn.IsEnabled = true; chooseBtn.IsEnabled = true; }
+        }
+        connectBtn.Click += async (_, _) => await ConnectFlow(false);
+        chooseBtn.Click += async (_, _) => await ConnectFlow(true);
+        SetConnected(false);
+
+        // Keep battery/paper status fresh while connected and idle.
+        var poll = new DispatcherTimer { Interval = TimeSpan.FromSeconds(30) };
+        poll.Tick += async (_, _) => {
+            if (!state.IsConnected || printing) return;
+            try { await state.Send(Cmd.GetBattery()); await Task.Delay(100); await state.Send(Cmd.GetStatus()); } catch { }
         };
+        poll.Start();
 
         // Preview
         var previewScroll = new ScrollViewer { Background = T.BG, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
@@ -459,86 +539,219 @@ class App {
         var consoleBorder = new Border { Background = T.Panel, BorderBrush = T.Border, BorderThickness = new Thickness(1,0,0,0) };
         Grid.SetColumn(consoleBorder, 1); Grid.SetRow(consoleBorder, 2); root.Children.Add(consoleBorder);
         var consoleDock = new DockPanel(); consoleBorder.Child = consoleDock;
-        DockPanel.SetDock(new TextBlock { Text = "CONSOLE", FontSize = 10, Foreground = T.TextDim, FontWeight = FontWeight.SemiBold, Margin = new Thickness(8,6,8,4) }, Dock.Top);
-        consoleDock.Children.Add(new TextBlock { Text = "CONSOLE", FontSize = 10, Foreground = T.TextDim, FontWeight = FontWeight.SemiBold, Margin = new Thickness(8,6,8,4) });
+        var copyLog = new Button { Content = "Copy", Height = 22, FontSize = 10, Padding = new Thickness(8,0), Background = T.Surface, Foreground = T.TextDim, BorderBrush = T.Border, Margin = new Thickness(0,0,4,0) };
+        var clearLog = new Button { Content = "Clear", Height = 22, FontSize = 10, Padding = new Thickness(8,0), Background = T.Surface, Foreground = T.TextDim, BorderBrush = T.Border, Margin = new Thickness(0,0,6,0) };
+        copyLog.Click += async (_, _) => { if (win.Clipboard != null) await win.Clipboard.SetTextAsync(string.Join("\n", log)); };
+        clearLog.Click += (_, _) => { log.Clear(); logBox.Text = ""; };
+        var consoleHead = new Grid { Height = 28 };
+        consoleHead.Children.Add(new TextBlock { Text = "CONSOLE", FontSize = 10, Foreground = T.TextDim, FontWeight = FontWeight.SemiBold, Margin = new Thickness(8,0), VerticalAlignment = VerticalAlignment.Center });
+        consoleHead.Children.Add(new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Center, Children = { copyLog, clearLog } });
+        DockPanel.SetDock(consoleHead, Dock.Top);
+        consoleDock.Children.Add(consoleHead);
         consoleDock.Children.Add(logBox);
 
         void Refresh() {
             canvasRef.Children.Clear();
-            int h = displayH;
-            for (int cy = 0; cy < (h + 7) / 8; cy++)
-                for (int cx = 0; cx < (paperW + 7) / 8; cx++) {
-                    var r = new Border { Width = 8, Height = 8, Background = (cx + cy) % 2 == 0 ? T.S(0x40,0x40,0x40) : T.S(0x60,0x60,0x60) };
-                    Canvas.SetLeft(r, 16 + cx * 8); Canvas.SetTop(r, 16 + cy * 8);
-                    canvasRef.Children.Add(r);
-                }
-            if (state.Image != null) {
-                var img = new Image { Source = state.Image, Width = state.ImgW > 0 ? state.ImgW : paperW, Height = state.ImgH > 0 ? state.ImgH : h };
-                Canvas.SetLeft(img, 16); Canvas.SetTop(img, 16); canvasRef.Children.Add(img);
-            }
-            foreach (var t in state.Texts) {
-                var tb = new TextBlock { Text = t.Text, FontSize = t.Size, FontFamily = new FontFamily("Segoe UI"), Foreground = state.Invert ? Brushes.White : Brushes.Black };
-                Canvas.SetLeft(tb, 16 + t.X); Canvas.SetTop(tb, 16 + t.Y); canvasRef.Children.Add(tb);
-            }
-            var dimLabel = new TextBlock { Text = $"{paperW}×{h}px", Foreground = T.TextDim, FontSize = 10 };
-            Canvas.SetLeft(dimLabel, 16); Canvas.SetTop(dimLabel, h + 22); canvasRef.Children.Add(dimLabel);
-            canvasRef.Width = paperW + 32; canvasRef.Height = h + 48;
+            using var mono = Render(state, (int)threshSlider.Value, ditherChk.IsChecked == true);
+            int h = mono.Height;
+            // Preview is the exact 1-bit output that will be sent (dark = burned dot).
+            using var preview = new SkiaSharp.SKBitmap(PaperW, h, SkiaSharp.SKColorType.Bgra8888, SkiaSharp.SKAlphaType.Opaque);
+            for (int y = 0; y < h; y++) for (int x = 0; x < PaperW; x++)
+                preview.SetPixel(x, y, mono.GetPixel(x, y).Red < 128 ? new SkiaSharp.SKColor(20, 20, 20) : new SkiaSharp.SKColor(250, 250, 245));
+            using var pimg = SkiaSharp.SKImage.FromBitmap(preview);
+            using var penc = pimg.Encode(SkiaSharp.SKEncodedImageFormat.Png, 100);
+            using var pms = new MemoryStream(penc.ToArray());
+            var paper = new Border { BorderBrush = T.Border, BorderThickness = new Thickness(1), Child = new Image { Source = new Bitmap(pms), Width = PaperW, Height = h } };
+            Canvas.SetLeft(paper, 16); Canvas.SetTop(paper, 16); canvasRef.Children.Add(paper);
+            var dimLabel = new TextBlock { Text = $"{PaperW} dots × {h} rows  (48 mm × {h / 8.0:0.#} mm @ 200 DPI)", Foreground = T.TextDim, FontSize = 10 };
+            Canvas.SetLeft(dimLabel, 16); Canvas.SetTop(dimLabel, h + 24); canvasRef.Children.Add(dimLabel);
+            canvasRef.Width = PaperW + 32; canvasRef.Height = h + 48;
         }
 
         // Print
         printBtn.Click += async (_, _) => {
             if (!state.IsConnected) { await ShowMsg(win, "Connect printer first"); return; }
-            printBtn.IsEnabled = false; printBtn.Content = "Printing...";
+            if (state.Source == null && state.Texts.Count == 0) { await ShowMsg(win, "Nothing to print — add an image or text first."); return; }
+            printing = true;
+            printBtn.IsEnabled = false; printBtn.Content = "Checking printer..."; printProgress.Value = 0; printProgress.IsVisible = true;
             try {
-                int h = displayH;
-                var info = new SkiaSharp.SKImageInfo(paperW, h, SkiaSharp.SKColorType.Bgra8888, SkiaSharp.SKAlphaType.Premul);
-                using var surface = SkiaSharp.SKSurface.Create(info);
-                var skCanvas = surface.Canvas;
-                skCanvas.Clear(state.Invert ? SkiaSharp.SKColors.Black : SkiaSharp.SKColors.White);
-                if (state.Image != null) {
-                    using var ms = new MemoryStream();
-                    state.Image.Save(ms); ms.Position = 0;
-                    var decoded = SkiaSharp.SKBitmap.Decode(ms);
-                    double scale = (double)paperW / decoded.Width;
-                    var resized = decoded.Resize(new SkiaSharp.SKImageInfo(paperW, (int)(decoded.Height * scale)), new SkiaSharp.SKSamplingOptions(SkiaSharp.SKFilterMode.Linear, SkiaSharp.SKMipmapMode.Linear));
-                    skCanvas.DrawBitmap(resized, 0, 0);
+                // Ask the printer for fresh status; refuse only if it reports a fault (a missing reply never blocks printing).
+                state.LastStatus = null;
+                await state.Send(Cmd.GetStatus());
+                for (int i = 0; i < 10 && state.LastStatus == null; i++) await Task.Delay(100);
+                if (state.LastStatus is var (po, co, oh) && (po || co || oh)) {
+                    var why = po ? "The printer is out of paper." : co ? "The printer cover is open." : "The printer is overheated — let it cool down.";
+                    Log($"Print blocked: {why}");
+                    await ShowMsg(win, why);
+                    return;
                 }
-                foreach (var t in state.Texts) {
-                    using var font = new SkiaSharp.SKFont(SkiaSharp.SKTypeface.FromFamilyName("Segoe UI"), t.Size);
-                    using var paint = new SkiaSharp.SKPaint { Color = state.Invert ? SkiaSharp.SKColors.White : SkiaSharp.SKColors.Black, IsAntialias = true };
-                    skCanvas.DrawText(t.Text, (float)t.X, (float)(t.Y + t.Size), SkiaSharp.SKTextAlign.Left, font, paint);
-                }
-                using var img = surface.Snapshot();
-                using var data = img.Encode();
-                var pixels = data.ToArray();
-                int bpr = (paperW + 7) / 8;
+                printBtn.Content = "Printing...";
+                using var mono = Render(state, (int)threshSlider.Value, ditherChk.IsChecked == true);
+                int h = mono.Height, bpr = PaperW / 8;
                 var escBits = new byte[bpr * h];
-                for (int y = 0; y < h; y++) for (int x = 0; x < paperW; x++) {
-                    int off = (y * paperW + x) * 4;
-                    if (off + 2 < pixels.Length) {
-                        int gray = (pixels[off + 2] * 30 + pixels[off + 1] * 59 + pixels[off] * 11) / 100;
-                        bool black = state.Invert ? gray > (int)threshSlider.Value : gray < (int)threshSlider.Value;
-                        if (black) escBits[y * bpr + x / 8] |= (byte)(0x80 >> (x % 8));
-                    }
-                }
+                for (int y = 0; y < h; y++) for (int x = 0; x < PaperW; x++)
+                    if (mono.GetPixel(x, y).Red < 128) escBits[y * bpr + x / 8] |= (byte)(0x80 >> (x % 8));
                 await state.Send(Cmd.PrintModeImg());
                 await Task.Delay(50);
-                await state.SendImage(escBits, bpr, h);
+                await state.SendImage(escBits, bpr, h, p => Dispatcher.UIThread.Post(() => printProgress.Value = p));
+                Log($"Print complete — {PaperW}×{h}px");
                 statusTxt.Text = "● Printed"; statusTxt.Foreground = T.Green;
-                Log($"Print complete — {bpr * 8}×{h}px");
             } catch (Exception ex) {
                 Log($"Print ERROR: {ex.Message}");
                 await ShowMsg(win, $"Print error: {ex.Message}");
             }
-            printBtn.IsEnabled = true; printBtn.Content = "PRINT";
+            finally { printing = false; printProgress.IsVisible = false; printBtn.IsEnabled = true; printBtn.Content = "PRINT"; }
         };
 
         Refresh();
         return win;
     }
 
+    // Live device picker: opens immediately, lists devices as the scan finds them, returns the chosen id (or null).
+    static async Task<string?> PickDevice(Window win, PrinterState state, Action<string> log) {
+        var devices = new Dictionary<string, (string name, int rssi)>();
+        var list = new ListBox { Background = T.BG, BorderBrush = T.Border, BorderThickness = new Thickness(1), MinHeight = 180 };
+        var scanTxt = new TextBlock { Text = "Scanning for Bluetooth devices...", Foreground = T.TextDim, FontSize = 11 };
+        var bar = new ProgressBar { IsIndeterminate = true, Height = 3, Foreground = T.Accent };
+        var hideUnnamed = new CheckBox { Content = "Hide unnamed devices", IsChecked = true, FontSize = 12, Foreground = T.Text };
+        var rescan = new Button { Content = "Rescan", Width = 90, Height = 30, HorizontalContentAlignment = HorizontalAlignment.Center, Background = T.Surface, Foreground = T.Text, BorderBrush = T.Border };
+        var cancel = new Button { Content = "Cancel", Width = 90, Height = 30, HorizontalContentAlignment = HorizontalAlignment.Center, Background = T.Surface, Foreground = T.Text, BorderBrush = T.Border };
+        var connect = new Button { Content = "Connect", Width = 100, Height = 30, IsEnabled = false, HorizontalContentAlignment = HorizontalAlignment.Center, Background = T.Accent, Foreground = Brushes.White };
+        var buttons = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, HorizontalAlignment = HorizontalAlignment.Right, Children = { rescan, cancel, connect } };
+        var body = new StackPanel { Margin = new Thickness(16), Spacing = 10, Children = {
+            new TextBlock { Text = "Select your printer", FontSize = 15, FontWeight = FontWeight.SemiBold, Foreground = T.Text },
+            scanTxt, bar, list, hideUnnamed, buttons } };
+        var dlg = new Window { Title = "Connect to Printer", Width = 420, SizeToContent = SizeToContent.Height, CanResize = false, Background = T.Panel, Foreground = T.Text, WindowStartupLocation = WindowStartupLocation.CenterOwner, Content = body };
+
+        string? result = null;
+        string? selectedId = null;
+        void Rebuild() {
+            var items = devices
+                .Where(d => hideUnnamed.IsChecked != true || d.Value.name.Length > 0)
+                .OrderByDescending(d => d.Value.name.Contains("print", StringComparison.OrdinalIgnoreCase))
+                .ThenByDescending(d => d.Value.name.Length > 0)
+                .ThenByDescending(d => d.Value.rssi)
+                .Select(d => new ListBoxItem {
+                    Tag = d.Key,
+                    Content = new StackPanel { Margin = new Thickness(4, 4), Children = {
+                        new TextBlock { Text = d.Value.name.Length > 0 ? d.Value.name : "Unnamed device", FontSize = 13, Foreground = d.Value.name.Length > 0 ? T.Text : T.TextDim,
+                            FontWeight = d.Value.name.Contains("print", StringComparison.OrdinalIgnoreCase) ? FontWeight.SemiBold : FontWeight.Normal },
+                        new TextBlock { Text = d.Value.rssi != 0 ? $"Signal {d.Value.rssi} dBm" : "Signal unknown", FontSize = 10, Foreground = T.TextDim } } }
+                }).ToList();
+            list.ItemsSource = items;
+            var keep = items.FirstOrDefault(i => (string?)i.Tag == selectedId)
+                       ?? items.FirstOrDefault(i => devices[(string)i.Tag!].name.Contains("print", StringComparison.OrdinalIgnoreCase));
+            if (keep != null) list.SelectedItem = keep;
+        }
+        list.SelectionChanged += (_, _) => { selectedId = (list.SelectedItem as ListBoxItem)?.Tag as string; connect.IsEnabled = selectedId != null; };
+        hideUnnamed.IsCheckedChanged += (_, _) => Rebuild();
+        void Accept() { if (selectedId != null) { result = selectedId; dlg.Close(); } }
+        connect.Click += (_, _) => Accept();
+        list.DoubleTapped += (_, _) => Accept();
+        cancel.Click += (_, _) => dlg.Close();
+
+        System.Threading.CancellationTokenSource? cts = null;
+        async Task Scan() {
+            cts?.Cancel(); cts = new System.Threading.CancellationTokenSource();
+            var token = cts.Token;
+            rescan.IsEnabled = false; bar.IsVisible = true; scanTxt.Text = "Scanning for Bluetooth devices...";
+            await state.ScanDevices(log, (id, name, rssi) => Dispatcher.UIThread.Post(() => { devices[id] = (name, rssi); Rebuild(); }), token);
+            if (token.IsCancellationRequested) return;
+            bar.IsVisible = false; rescan.IsEnabled = true;
+            scanTxt.Text = devices.Count == 0 ? "No devices found. Make sure the printer is on and in range, then Rescan." : $"Scan finished — {devices.Count} device(s).";
+        }
+        rescan.Click += async (_, _) => { devices.Clear(); selectedId = null; Rebuild(); await Scan(); };
+        dlg.Closed += (_, _) => cts?.Cancel();
+        dlg.Opened += async (_, _) => await Scan();
+        await dlg.ShowDialog(win);
+        return result;
+    }
+
+    // Composes the image (scaled to 384 dots) then text blocks top-to-bottom and returns a bitmap
+    // whose pixels are strictly 0 (burn) or 255 (blank). Shared by preview and print so they match.
+    static SkiaSharp.SKBitmap Render(PrinterState st, int threshold, bool dither) {
+        const int W = 384, Pad = 8;
+        SkiaSharp.SKBitmap? scaled = null;
+        if (st.Source != null) {
+            int ih = Math.Max(1, (int)Math.Round(st.Source.Height * (double)W / st.Source.Width));
+            scaled = st.Source.Resize(new SkiaSharp.SKImageInfo(W, ih), new SkiaSharp.SKSamplingOptions(SkiaSharp.SKFilterMode.Linear, SkiaSharp.SKMipmapMode.Linear));
+        }
+        int imgRows = scaled?.Height ?? 0;
+        var tf = SkiaSharp.SKTypeface.FromFamilyName("Segoe UI");
+        var tfBold = SkiaSharp.SKTypeface.FromFamilyName("Segoe UI", SkiaSharp.SKFontStyle.Bold);
+        var blocks = new List<(TextLayer t, string[] lines, SkiaSharp.SKFont font, float lh)>();
+        int height = imgRows;
+        foreach (var t in st.Texts) {
+            var font = new SkiaSharp.SKFont(t.Bold ? tfBold : tf, t.Size);
+            var lines = WrapText(t.Text, font, W - Pad * 2);
+            float lh = font.Spacing;
+            blocks.Add((t, lines, font, lh));
+            height += Pad + (int)Math.Ceiling(lh * lines.Length);
+        }
+        height = Math.Max(height + (blocks.Count > 0 ? Pad : 0), 64);
+        var gray = new SkiaSharp.SKBitmap(new SkiaSharp.SKImageInfo(W, height, SkiaSharp.SKColorType.Gray8, SkiaSharp.SKAlphaType.Opaque));
+        using (var surf = SkiaSharp.SKSurface.Create(new SkiaSharp.SKImageInfo(W, height, SkiaSharp.SKColorType.Bgra8888, SkiaSharp.SKAlphaType.Premul))) {
+            var c = surf.Canvas; c.Clear(SkiaSharp.SKColors.White);
+            int y = 0;
+            if (scaled != null) { c.DrawBitmap(scaled, 0, 0); y = imgRows; }
+            using var paint = new SkiaSharp.SKPaint { Color = SkiaSharp.SKColors.Black, IsAntialias = true };
+            foreach (var (t, lines, font, lh) in blocks) {
+                y += Pad;
+                foreach (var ln in lines) {
+                    float w = font.MeasureText(ln);
+                    float x = t.Align == 1 ? (W - w) / 2 : t.Align == 2 ? W - Pad - w : Pad;
+                    c.DrawText(ln, x, y - font.Metrics.Ascent, SkiaSharp.SKTextAlign.Left, font, paint);
+                    y += (int)Math.Ceiling(lh);
+                }
+                font.Dispose();
+            }
+            using var snap = surf.Snapshot();
+            if (!snap.ReadPixels(gray.Info, gray.GetPixels(), gray.RowBytes, 0, 0)) throw new Exception("Render failed");
+        }
+        scaled?.Dispose();
+        // Threshold, with error diffusion on the image rows only so text stays crisp.
+        var raw = gray.GetPixelSpan();
+        var buf = new float[W * height];
+        for (int i = 0; i < buf.Length; i++) buf[i] = raw[i];
+        for (int yy = 0; yy < height; yy++) for (int xx = 0; xx < W; xx++) {
+            int i = yy * W + xx;
+            float old = buf[i];
+            float nw = old < threshold ? 0 : 255;
+            if (dither && yy < imgRows) {
+                float err = old - nw;
+                if (xx + 1 < W) buf[i + 1] += err * 7 / 16;
+                if (yy + 1 < height) {
+                    if (xx > 0) buf[i + W - 1] += err * 3 / 16;
+                    buf[i + W] += err * 5 / 16;
+                    if (xx + 1 < W) buf[i + W + 1] += err * 1 / 16;
+                }
+            }
+            bool black = nw == 0;
+            if (st.Invert) black = !black;
+            raw[i] = black ? (byte)0 : (byte)255;
+        }
+        return gray;
+    }
+
+    static string[] WrapText(string text, SkiaSharp.SKFont font, float maxW) {
+        var result = new List<string>();
+        foreach (var para in text.Replace("\r", "").Split('\n')) {
+            var cur = "";
+            foreach (var word in para.Split(' ')) {
+                var test = cur.Length == 0 ? word : cur + " " + word;
+                if (cur.Length == 0 || font.MeasureText(test) <= maxW) cur = test;
+                else { result.Add(cur); cur = word; }
+            }
+            result.Add(cur);
+        }
+        return result.ToArray();
+    }
+
     static async Task ShowMsg(Window win, string msg) {
-        var dlg = new Window { Title = "ThermalPrint", Width = 360, Height = 160, WindowStartupLocation = WindowStartupLocation.CenterOwner, Content = new TextBlock { Text = msg, Margin = new Thickness(20), TextWrapping = TextWrapping.Wrap } };
+        var ok = new Button { Content = "OK", Width = 80, HorizontalAlignment = HorizontalAlignment.Right, HorizontalContentAlignment = HorizontalAlignment.Center, Background = T.Accent, Foreground = Brushes.White };
+        var body = new StackPanel { Margin = new Thickness(20), Spacing = 16, Children = { new TextBlock { Text = msg, TextWrapping = TextWrapping.Wrap, Foreground = T.Text }, ok } };
+        var dlg = new Window { Title = "ThermalPrint", Width = 380, SizeToContent = SizeToContent.Height, CanResize = false, Background = T.Panel, WindowStartupLocation = WindowStartupLocation.CenterOwner, Content = body };
+        ok.Click += (_, _) => dlg.Close();
         await dlg.ShowDialog(win);
     }
 }
@@ -554,7 +767,7 @@ class TrayHelper {
         _onToggle = onToggle; _onExit = onExit;
         _hWnd = App._mainWindow?.TryGetPlatformHandle()?.Handle ?? IntPtr.Zero;
         if (_hWnd == IntPtr.Zero) return;
-        _hIcon = LoadIconFromFile(Path.Combine(AppContext.BaseDirectory, "thermalprint.png"));
+        _hIcon = LoadIconFromResource();
         if (_hIcon == IntPtr.Zero) _hIcon = LoadSystemIcon();
         _nid = new TrayIcon.NOTIFYICONDATA { cbSize = Marshal.SizeOf<TrayIcon.NOTIFYICONDATA>(), hWnd = _hWnd, uID = 1, uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP, uCallbackMessage = TrayIcon.WM_TRAYICON, hIcon = _hIcon, szTip = "ThermalPrint" };
         Shell_NotifyIcon(NIM_ADD, ref _nid);
@@ -643,10 +856,11 @@ class TrayHelper {
         if (_hIcon != IntPtr.Zero) { DestroyIcon(_hIcon); _hIcon = IntPtr.Zero; }
     }
 
-    static IntPtr LoadIconFromFile(string path) {
+    static IntPtr LoadIconFromResource() {
         try {
-            if (!File.Exists(path)) return IntPtr.Zero;
-            using var bmp = new System.Drawing.Bitmap(path);
+            using var st = App.AppIcon();
+            if (st == null) return IntPtr.Zero;
+            using var bmp = new System.Drawing.Bitmap(st);
             var icon = System.Drawing.Icon.FromHandle(bmp.GetHicon());
             return icon.Handle;
         } catch { return IntPtr.Zero; }
@@ -681,11 +895,14 @@ class TrayHelper {
 
 public class PrinterState {
 #if GUI
-    public Bitmap? Image;
+    public SkiaSharp.SKBitmap? Source;
 #endif
     public List<TextLayer> Texts = new();
-    public bool Invert, IsConnected, BWPreview;
-    public int ImgW, ImgH;
+    public bool Invert, IsConnected;
+    public Action? ConnectionLost;
+    public int? Battery;
+    public (bool paperOut, bool coverOpen, bool overheat)? LastStatus;
+    bool _lostHooked;
     ICharacteristic? _tx;
     IAdapter? _adapter;
     IDevice? _device;
@@ -694,7 +911,12 @@ public class PrinterState {
     const int MTU = 182;
     const string PRINTER_SVC = "49535343-fe7d-4ae5-8fa9-9fafd205e455";
 
-    public void Clear() { Texts.Clear(); ImgW = 0; ImgH = 0; }
+    public void Clear() {
+        Texts.Clear();
+#if GUI
+        Source?.Dispose(); Source = null;
+#endif
+    }
     public void Disconnect() {
         _tx = null; IsConnected = false;
         if (_device != null) _adapter?.DisconnectDeviceAsync(_device);
@@ -708,39 +930,23 @@ public class PrinterState {
         }
     }
 
-    public async Task<string?> ScanForPrinter(string svcUuid) {
-        try { return await ScanForPrinter(svcUuid, _ => { }); }
-        catch { return null; }
-    }
-    public async Task<string?> ScanForPrinter(string svcUuid, Action<string> log) {
-        log("Scanning for thermal printers...");
-        try { var ble = CrossBluetoothLE.Current; log($"BLE available: {ble.IsAvailable}, state: {ble.State}"); } catch (Exception ex) { log($"BLE init error: {ex.Message}"); return null; }
+    // Streams discovered devices to onFound(id, name, rssi) until the scan timeout or cancellation.
+    public async Task ScanDevices(Action<string> log, Action<string, string, int> onFound, System.Threading.CancellationToken ct) {
+        log("Scanning for Bluetooth devices...");
+        try { var ble = CrossBluetoothLE.Current; log($"BLE available: {ble.IsAvailable}, state: {ble.State}"); if (!ble.IsAvailable || ble.State != BluetoothState.On) { log("Bluetooth is off or unavailable."); return; } }
+        catch (Exception ex) { log($"BLE init error: {ex.Message}"); return; }
         _adapter = CrossBluetoothLE.Current.Adapter;
-        _adapter.ScanTimeout = 8000;
+        _adapter.ScanTimeout = 10000;
         _adapter.ScanMode = ScanMode.LowLatency;
-        var found = new ConcurrentBag<IDevice>();
-        void OnFound(object? s, DeviceEventArgs a) {
-            var name = string.IsNullOrEmpty(a.Device.Name) ? $"Bluetooth {a.Device.Id}" : a.Device.Name;
-            log($"Found: {name} ({a.Device.Id})");
-            found.Add(a.Device);
-        }
+        void OnFound(object? s, DeviceEventArgs a) => onFound(a.Device.Id.ToString(), a.Device.Name ?? "", a.Device.Rssi);
         _adapter.DeviceDiscovered += OnFound;
-        try { await _adapter.StartScanningForDevicesAsync(new ScanFilterOptions { ServiceUuids = new[] { Guid.Parse(svcUuid) } }); } catch { }
-        if (found.Count == 0) {
-            log("Trying unfiltered scan...");
-            try { await _adapter.StartScanningForDevicesAsync(); } catch { }
+        try { await _adapter.StartScanningForDevicesAsync((ScanFilterOptions?)null, null, false, ct); }
+        catch (Exception ex) { if (!ct.IsCancellationRequested) log($"Scan error: {ex.Message}"); }
+        finally {
+            _adapter.DeviceDiscovered -= OnFound;
+            try { await _adapter.StopScanningForDevicesAsync(); } catch { }
         }
-        await _adapter.StopScanningForDevicesAsync();
-        _adapter.DeviceDiscovered -= OnFound;
-        var all = found.ToList();
-        var discovered = _adapter.DiscoveredDevices;
-        if (discovered != null && discovered.Count > all.Count) all = discovered.ToList();
-        log($"Scan complete — {all.Count} device(s)");
-        var printer = all.FirstOrDefault(d => !string.IsNullOrEmpty(d.Name) && d.Name.Contains("Print", StringComparison.OrdinalIgnoreCase));
-        printer ??= all.FirstOrDefault(d => !string.IsNullOrEmpty(d.Name));
-        printer ??= all.FirstOrDefault();
-        if (printer != null) { log($"Selected: {printer.Name ?? printer.Id.ToString()}"); return printer.Id.ToString(); }
-        log("No devices found."); return null;
+        log("Scan complete.");
     }
 
     public async Task Connect(string deviceId, string txUuid, string rxUuid) {
@@ -749,8 +955,12 @@ public class PrinterState {
     }
     public async Task Connect(string deviceId, string txUuid, string rxUuid, Action<string> log, Func<byte[], Task> onRx) {
         _log = log; _onRx = onRx;
+        _adapter ??= CrossBluetoothLE.Current.Adapter;
         log("Connecting...");
-        _adapter!.DeviceConnectionLost += (_, _) => { IsConnected = false; _tx = null; log("Connection lost."); };
+        if (!_lostHooked) {
+            _lostHooked = true;
+            _adapter!.DeviceConnectionLost += (_, _) => { IsConnected = false; _tx = null; log("Connection lost."); ConnectionLost?.Invoke(); };
+        }
         IDevice? device = null;
         try { device = await _adapter.ConnectToKnownDeviceAsync(Guid.Parse(deviceId), new ConnectParameters(false, true)); } catch { }
         if (device == null) throw new Exception("Device not found");
@@ -782,7 +992,7 @@ public class PrinterState {
         log("Connected. Printer initialized.");
     }
 
-    public async Task SendImage(byte[] packedBits, int bytesPerRow, int height) {
+    public async Task SendImage(byte[] packedBits, int bytesPerRow, int height, Action<double>? progress = null) {
         if (_tx == null) throw new Exception("Not connected");
         var buf = new List<byte>();
         buf.AddRange(Cmd.EscInit());
@@ -794,10 +1004,12 @@ public class PrinterState {
         var data = buf.ToArray();
         _log?.Invoke($"TX: {data.Length} bytes, {(data.Length + MTU - 1) / MTU} chunks");
         for (int i = 0; i < data.Length; i += MTU) {
+            if (_tx == null || !IsConnected) throw new Exception("Connection lost during print");
             await _tx.WriteAsync(data[i..Math.Min(i + MTU, data.Length)]);
             await Task.Delay(20);
+            progress?.Invoke(Math.Min(1.0, (double)(i + MTU) / data.Length));
         }
     }
 }
 
-public record TextLayer(string Text, int Size, double X, double Y);
+public record TextLayer(string Text, int Size, int Align, bool Bold);
